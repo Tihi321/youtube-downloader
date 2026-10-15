@@ -218,6 +218,8 @@ pub fn build_args(req: &JobRequest, kind: PassKind, tmp: &Path) -> Vec<String> {
     push("4");
     push("--ffmpeg-location");
     a.push(tools::bin_dir().to_string_lossy().into_owned());
+    a.push("--js-runtimes".into());
+    a.push(format!("deno:{}", tools::deno_path().to_string_lossy()));
     let mut push = |s: &str| a.push(s.to_string());
     if is_playlist(req) {
         push("--yes-playlist");

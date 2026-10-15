@@ -10,6 +10,9 @@ use tokio::io::AsyncWriteExt;
 
 const YTDLP_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
 const FFMPEG_URL: &str = "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip";
+/// yt-dlp needs a JS runtime to solve YouTube's player challenges; without it
+/// many videos (e.g. "made for kids") report "This video is not available".
+const DENO_URL: &str = "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 static ENSURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -38,8 +41,15 @@ pub fn ffmpeg_path() -> PathBuf {
     bin_dir().join("ffmpeg.exe")
 }
 
+pub fn deno_path() -> PathBuf {
+    bin_dir().join("deno.exe")
+}
+
 pub fn is_ready() -> bool {
-    ytdlp_path().exists() && ffmpeg_path().exists() && bin_dir().join("ffprobe.exe").exists()
+    ytdlp_path().exists()
+        && ffmpeg_path().exists()
+        && bin_dir().join("ffprobe.exe").exists()
+        && deno_path().exists()
 }
 
 /// A hidden-window command with UTF-8 forced for Python's stdio.
@@ -123,6 +133,20 @@ fn extract_ffmpeg(zip_path: &Path, dest_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn extract_deno(zip_path: &Path, dest: &Path) -> Result<()> {
+    let file = std::fs::File::open(zip_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let mut entry = archive
+        .by_name("deno.exe")
+        .map_err(|_| anyhow!("deno archive did not contain deno.exe"))?;
+    let tmp = dest.with_extension("exe.part");
+    let mut out = std::fs::File::create(&tmp)?;
+    std::io::copy(&mut entry, &mut out)?;
+    drop(out);
+    std::fs::rename(&tmp, dest)?;
+    Ok(())
+}
+
 /// Download whatever is missing. Safe to call repeatedly / concurrently.
 pub async fn ensure_with<F>(emit: &F) -> Result<()>
 where
@@ -147,6 +171,19 @@ where
         let zp = zip_path.clone();
         let d = dir.clone();
         tokio::task::spawn_blocking(move || extract_ffmpeg(&zp, &d)).await??;
+        let _ = tokio::fs::remove_file(&zip_path).await;
+    }
+    if !deno_path().exists() {
+        let zip_path = dir.join("deno.zip");
+        download_file(DENO_URL, &zip_path, "deno", emit).await?;
+        emit(SetupProgress {
+            stage: "deno".into(),
+            percent: None,
+            message: "Extracting deno…".into(),
+            done: false,
+        });
+        let zp = zip_path.clone();
+        tokio::task::spawn_blocking(move || extract_deno(&zp, &deno_path())).await??;
         let _ = tokio::fs::remove_file(&zip_path).await;
     }
     emit(SetupProgress {
