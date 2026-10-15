@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>YouTube Downloader</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="setup" class="setup hidden">
+    <div class="setup-title" id="setup-title">Setting up tools…</div>
+    <div class="bar"><div class="bar-fill" id="setup-bar"></div></div>
+    <div class="muted small" id="setup-msg"></div>
+    <div class="error small hidden" id="setup-error"></div>
+    <button id="setup-retry" class="hidden">Retry</button>
+  </div>
+
+  <main id="app">
+    <section class="card">
+      <div class="row">
+        <input id="url" type="text" placeholder="Paste a YouTube video or playlist URL" spellcheck="false" />
+        <button id="paste" title="Paste from clipboard">Paste</button>
+      </div>
+      <label class="check hidden" id="playlist-row">
+        <input type="checkbox" id="playlist" /> Download entire playlist
+      </label>
+
+      <div class="modes">
+        <label class="check"><input type="checkbox" id="m-video" /> Video</label>
+        <label class="check"><input type="checkbox" id="m-audio" /> Audio</label>
+        <label class="check"><input type="checkbox" id="m-transcript" /> Transcript</label>
+      </div>
+
+      <div class="options">
+        <div class="opt" id="opt-video">
+          <span class="opt-label">Video quality</span>
+          <select id="video-quality">
+            <option value="best">Best</option>
+            <option value="1080">1080p</option>
+            <option value="720">720p</option>
+            <option value="480">480p</option>
+          </select>
+        </div>
+        <div class="opt" id="opt-audio">
+          <span class="opt-label">Audio format</span>
+          <select id="audio-format">
+            <option value="mp3">MP3 (320k)</option>
+            <option value="m4a">M4A (original)</option>
+          </select>
+        </div>
+        <div class="opt" id="opt-transcript">
+          <span class="opt-label">Transcript</span>
+          <select id="transcript-format">
+            <option value="txt">TXT</option>
+            <option value="timestamped">Timestamped TXT</option>
+            <option value="srt">SRT</option>
+            <option value="vtt">VTT</option>
+            <option value="json">JSON</option>
+          </select>
+          <input id="lang" type="text" class="lang" value="en" maxlength="12" title="Language code" spellcheck="false" />
+        </div>
+      </div>
+
+      <div class="row">
+        <input id="out-dir" type="text" readonly title="Output folder" />
+        <button id="browse">Browse</button>
+        <button id="open-out">Open</button>
+      </div>
+
+      <button id="download" class="primary">Download</button>
+      <div class="error small hidden" id="form-error"></div>
+    </section>
+
+    <section class="jobs" id="jobs">
+      <div class="muted small empty" id="jobs-empty">No downloads yet.</div>
+    </section>
+  </main>
+
+  <footer>
+    <span class="muted small" id="ytdlp-version">yt-dlp: …</span>
+    <button id="update" class="small-btn">Update yt-dlp</button>
+  </footer>
+
+  <script src="main.js"></script>
+</body>
+</html>

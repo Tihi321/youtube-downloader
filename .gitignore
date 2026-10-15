@@ -1,0 +1,4 @@
+node_modules/
+.claude/temp/
+src-tauri/target/
+src-tauri/gen/
