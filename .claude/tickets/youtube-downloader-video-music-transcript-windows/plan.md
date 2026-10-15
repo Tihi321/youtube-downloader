@@ -131,3 +131,7 @@ Deviations / notes:
 - Transcript filename uses the media stem (`<title> [<id>].<lang>.<ext>`) per the task note, not `<title>.<lang>.<ext>`.
 - Added `rust-version = "1.89"` and `.cargo/config.toml` (MSRV-aware resolver).
 - Not handled: recent yt-dlp may need a JS runtime (e.g. Deno) for some YouTube formats.
+
+- Deviation (user request): package manager switched from npm to Yarn 4.13 (`packageManager` field, `.yarnrc.yml` nodeLinker: node-modules). Use `yarn install` / `yarn dev` / `yarn build`.
+- Deviation (user request): project pinned to Rust 1.99.0 via `rust-toolchain.toml`; MSRV fallback resolver config removed.
+

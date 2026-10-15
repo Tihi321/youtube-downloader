@@ -28,23 +28,22 @@ single video or a whole playlist. It lives in the system tray and shows a progre
 Settings are stored in `%APPDATA%\com.tihi321.ytdownloader\settings.json`.
 
 ## Build
-Requirements: Windows 10/11, Node.js + npm, Rust (MSVC toolchain, rustc 1.89+) and the
+Requirements: Windows 10/11, Node.js + Yarn 4 (`corepack enable`), Rust (MSVC toolchain; `rust-toolchain.toml` pins 1.99.0) and the
 **Visual Studio Build Tools with the "Desktop development with C++" workload** (MSVC `link.exe` + Windows SDK).
 WebView2 is preinstalled on Windows 11.
 
 ```
-npm install
-npm run dev      # run in development
-npm run build    # release exe + NSIS installer
+yarn install
+yarn dev         # run in development
+yarn build       # release exe + NSIS installer
 ```
 Outputs: `src-tauri/target/release/yt-downloader.exe` (portable) and
 `src-tauri/target/release/bundle/nsis/yt-downloader_0.1.0_x64-setup.exe`.
 
-`src-tauri/.cargo/config.toml` enables Cargo's MSRV-aware resolver so dependencies resolve to versions compatible with
-the installed rustc. Run `cargo test` in `src-tauri` for the transcript unit tests; the network smoke test is ignored by
+Run `cargo test` in `src-tauri` for the transcript unit tests; the network smoke test is ignored by
 default (`cargo test -- --ignored`).
 
-The icon is generated from `src-tauri/app-icon.png` with `npx tauri icon src-tauri/app-icon.png`.
+The icon is generated from `src-tauri/app-icon.png` with `yarn tauri icon src-tauri/app-icon.png`.
 
 ## Legal
 For personal use only. Download only content you have the right to, and respect YouTube's Terms of Service and the
