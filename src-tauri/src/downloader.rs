@@ -271,14 +271,30 @@ pub fn build_args(req: &JobRequest, kind: PassKind, tmp: &Path) -> Vec<String> {
         }
         PassKind::Transcript => {
             let l = req.lang.trim();
-            for s in ["--skip-download", "--write-subs", "--write-auto-subs"] {
+            // `--ignore-errors`: YouTube rate-limits timedtext (HTTP 429) after a
+            // couple of back-to-back requests; without it one bad track aborts
+            // the whole video before the info-json is written.
+            for s in [
+                "--skip-download",
+                "--write-subs",
+                "--write-auto-subs",
+                "--ignore-errors",
+                "--sleep-subtitles",
+                "2",
+            ] {
                 a.push(s.into());
             }
+            // Do not use `{l}.*` (or `{l}-XX`; yt-dlp matches case-insensitively):
+            // it also matches every auto-translated track (en-en, en-de, ...),
+            // each one an extra request that gets 429'd.
             a.push("--sub-langs".into());
-            a.push(format!("{l},{l}-orig,{l}.*"));
+            a.push(format!("{l},{l}-orig"));
             a.push("--sub-format".into());
             a.push("json3".into());
             a.push("--write-info-json".into());
+            // The default cleaning strips `requested_subtitles` (our only map to
+            // the written json3 files) from the info-json.
+            a.push("--no-clean-info-json".into());
             a.push("--no-write-playlist-metafiles".into());
             a.push("-o".into());
             let t = tmp.to_string_lossy().replace('\\', "/").replace('%', "%%");
@@ -314,11 +330,63 @@ fn pick_subtitle_key(subs: &serde_json::Map<String, serde_json::Value>, lang: &s
         .cloned()
 }
 
-/// Convert every downloaded json3 referenced from `*.info.json` files in `tmp`
-/// into the chosen format, next to where yt-dlp wrote the json3 (the media
-/// folder, same name stem). Removes the json3 + info files.
-pub fn finish_transcripts(tmp: &Path, lang: &str, fmt: Format) -> Vec<TranscriptOutcome> {
-    let mut outcomes = Vec::new();
+/// Pick a *manual* caption track for `lang` out of an info-json's `subtitles`
+/// map: the exact `lang` key if present, else a regional one (`{lang}-<region>`,
+/// e.g. `en-US`; case-insensitive, first in key order). Auto-translated tracks
+/// (`en-de`, `ab-en`, ...) are never in `subtitles`, they live in
+/// `automatic_captions`, which is deliberately not looked at.
+fn pick_regional_key(info: &serde_json::Value, lang: &str) -> Option<String> {
+    let subs = info.get("subtitles")?.as_object()?;
+    if lang.is_empty() {
+        return None;
+    }
+    if subs.contains_key(lang) {
+        return Some(lang.to_string());
+    }
+    let prefix = format!("{}-", lang.to_lowercase());
+    let mut keys: Vec<&String> = subs
+        .keys()
+        .filter(|k| {
+            let k = k.to_lowercase();
+            k.starts_with(&prefix) && !k.ends_with("-orig")
+        })
+        .collect();
+    keys.sort();
+    keys.first().map(|k| k.to_string())
+}
+
+/// Regex for `--sub-langs` that matches exactly `key` (yt-dlp full-matches
+/// the values as case-insensitive regexes).
+fn exact_sub_langs(key: &str) -> String {
+    key.chars()
+        .flat_map(|c| {
+            let esc = !(c.is_ascii_alphanumeric() || c == '_');
+            esc.then_some('\\').into_iter().chain(std::iter::once(c))
+        })
+        .collect()
+}
+
+/// Args for the one-off regional fetch of a video the first transcript pass
+/// wrote no track for: same as the transcript pass, but fed the already saved
+/// `info` (no page re-extraction), asking for exactly `key`, and writing the
+/// refreshed info-json over `info` so `finish_transcripts` sees the result.
+pub fn build_regional_args(req: &JobRequest, tmp: &Path, info: &Path, key: &str) -> Vec<String> {
+    let mut a = build_args(req, PassKind::Transcript, tmp);
+    a.pop(); // the url
+    if let Some(i) = a.iter().position(|s| s == "--sub-langs") {
+        a[i + 1] = exact_sub_langs(key);
+    }
+    if let Some(i) = a.iter().position(|s| s.starts_with("infojson:")) {
+        let path = info.to_string_lossy().replace('\\', "/").replace('%', "%%");
+        let stem = path.strip_suffix(".info.json").unwrap_or(&path);
+        a[i] = format!("infojson:{stem}.%(ext)s");
+    }
+    a.push("--load-info-json".into());
+    a.push(info.to_string_lossy().into_owned());
+    a
+}
+
+fn list_info_jsons(tmp: &Path) -> Vec<PathBuf> {
     let mut infos: Vec<PathBuf> = std::fs::read_dir(tmp)
         .map(|rd| {
             rd.filter_map(|e| e.ok())
@@ -332,13 +400,45 @@ pub fn finish_transcripts(tmp: &Path, lang: &str, fmt: Format) -> Vec<Transcript
         })
         .unwrap_or_default();
     infos.sort();
-    for info_path in infos {
-        let info: serde_json::Value = match std::fs::read_to_string(&info_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-        {
-            Some(v) => v,
-            None => continue,
+    infos
+}
+
+fn read_info(path: &Path) -> Option<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
+fn has_requested_subtitles(info: &serde_json::Value) -> bool {
+    info.get("requested_subtitles")
+        .and_then(|s| s.as_object())
+        .is_some_and(|m| !m.is_empty())
+}
+
+/// Videos in `tmp` whose first transcript pass wrote no track but that have a
+/// manual track to try (see `pick_regional_key`): `(info-json path, key)`.
+pub fn regional_fallbacks(tmp: &Path, lang: &str) -> Vec<(PathBuf, String)> {
+    list_info_jsons(tmp)
+        .into_iter()
+        .filter_map(|p| {
+            let info = read_info(&p)?;
+            if has_requested_subtitles(&info) {
+                return None;
+            }
+            let key = pick_regional_key(&info, lang)?;
+            Some((p, key))
+        })
+        .collect()
+}
+
+/// Convert every downloaded json3 referenced from `*.info.json` files in `tmp`
+/// into the chosen format, next to where yt-dlp wrote the json3 (the media
+/// folder, same name stem). Removes the json3 + info files.
+pub fn finish_transcripts(tmp: &Path, lang: &str, fmt: Format) -> Vec<TranscriptOutcome> {
+    let mut outcomes = Vec::new();
+    for info_path in list_info_jsons(tmp) {
+        let Some(info) = read_info(&info_path) else {
+            continue;
         };
         let _ = std::fs::remove_file(&info_path);
         let title = info
@@ -512,12 +612,15 @@ fn handle_line(rep: &mut Reporter, res: &mut PassResult, item_re: &Regex, line: 
 }
 
 async fn run_pass(rep: &mut Reporter, ctl: &JobCtl, req: &JobRequest, kind: PassKind, tmp: &Path) -> PassResult {
+    run_ytdlp(rep, ctl, build_args(req, kind, tmp), kind).await
+}
+
+async fn run_ytdlp(rep: &mut Reporter, ctl: &JobCtl, args: Vec<String>, kind: PassKind) -> PassResult {
     let mut res = PassResult::default();
     if ctl.cancelled.load(Ordering::SeqCst) {
         res.cancelled = true;
         return res;
     }
-    let args = build_args(req, kind, tmp);
     let mut cmd = tools::hidden_command(tools::ytdlp_path());
     cmd.args(&args)
         .stdin(Stdio::null())
@@ -668,6 +771,21 @@ async fn run_job(app: &AppHandle, id: u64, req: JobRequest, ctl: Arc<JobCtl>) {
             rep.ev.message = Some("Converting transcripts…".into());
             rep.emit();
             let fmt = Format::parse(&req.transcript_format);
+            // One extra fetch per video that got nothing but has a regional
+            // manual track (en-US for "en"); videos that succeeded are skipped.
+            for (info, key) in regional_fallbacks(&tmp, req.lang.trim()) {
+                let args = build_regional_args(&req, &tmp, &info, &key);
+                let r = run_ytdlp(&mut rep, &ctl, args, *kind).await;
+                if r.cancelled {
+                    cancelled = true;
+                    break;
+                }
+                warnings.extend(r.spawn_error);
+                warnings.extend(r.errors.iter().map(|e| format!("Captions \"{key}\": {}", short_err(e))));
+            }
+            if cancelled {
+                break;
+            }
             let outcomes = finish_transcripts(&tmp, req.lang.trim(), fmt);
             let mut wrote = 0;
             for o in outcomes {
@@ -754,6 +872,129 @@ mod tests {
         let a = build_args(&r, PassKind::Video, Path::new("x"));
         assert!(a.iter().any(|s| s.contains("height<=720")));
         assert!(a.contains(&"--no-playlist".to_string()));
+    }
+
+    fn arg_after<'a>(a: &'a [String], flag: &str) -> Option<&'a str> {
+        a.iter().position(|s| s == flag).map(|i| a[i + 1].as_str())
+    }
+
+    #[test]
+    fn transcript_args_request_exact_langs_only() {
+        let a = build_args(&req("https://youtu.be/abc"), PassKind::Transcript, Path::new("x"));
+        assert_eq!(arg_after(&a, "--sub-langs"), Some("en,en-orig"));
+        for flag in ["--ignore-errors", "--sleep-subtitles", "--no-clean-info-json", "--write-info-json"] {
+            assert!(a.contains(&flag.to_string()), "missing {flag}");
+        }
+        assert_eq!(arg_after(&a, "--sleep-subtitles"), Some("2"));
+    }
+
+    #[test]
+    fn media_args_have_no_subtitle_sleep() {
+        for kind in [PassKind::Video, PassKind::Audio] {
+            let a = build_args(&req("https://youtu.be/abc"), kind, Path::new("x"));
+            assert!(!a.contains(&"--sleep-subtitles".to_string()));
+            assert!(!a.contains(&"--sub-langs".to_string()));
+        }
+    }
+
+    fn info_with(subtitles: serde_json::Value) -> serde_json::Value {
+        // Shape taken from a real info-json: manual tracks in `subtitles`,
+        // auto + auto-translated ones (`en-en`, `en-de`, `ab-en`) in
+        // `automatic_captions`.
+        serde_json::json!({
+            "subtitles": subtitles,
+            "automatic_captions": {
+                "en": [{"ext": "vtt"}],
+                "en-en": [{"ext": "json3", "name": "English from English"}],
+                "en-de": [{"ext": "json3", "name": "English from German"}],
+                "ab-en": [{"ext": "json3", "name": "Abkhazian from English"}],
+            }
+        })
+    }
+
+    #[test]
+    fn regional_key_picks_regional_track_without_exact() {
+        let t = serde_json::json!([{"ext": "json3"}]);
+        let info = info_with(serde_json::json!({"en-US": t, "de": t}));
+        assert_eq!(pick_regional_key(&info, "en"), Some("en-US".into()));
+        let info = info_with(serde_json::json!({"en-US": t, "en-GB": t}));
+        assert_eq!(pick_regional_key(&info, "en"), Some("en-GB".into()));
+    }
+
+    #[test]
+    fn regional_key_prefers_exact_track() {
+        let t = serde_json::json!([{"ext": "json3"}]);
+        let info = info_with(serde_json::json!({"en-GB": t, "en": t, "en-US": t}));
+        assert_eq!(pick_regional_key(&info, "en"), Some("en".into()));
+    }
+
+    #[test]
+    fn regional_key_ignores_translations_and_other_langs() {
+        let t = serde_json::json!([{"ext": "json3"}]);
+        // Translation keys only exist under `automatic_captions`.
+        let info = info_with(serde_json::json!({"de": t, "fr-CA": t}));
+        assert_eq!(pick_regional_key(&info, "en"), None);
+        assert_eq!(pick_regional_key(&info_with(serde_json::json!({})), "en"), None);
+        assert_eq!(pick_regional_key(&serde_json::json!({"subtitles": null}), "en"), None);
+        // `en` is not a prefix of `eng-...`, and `-orig` is the first pass' job.
+        let info = info_with(serde_json::json!({"eng-US": t, "en-orig": t, "enUS": t}));
+        assert_eq!(pick_regional_key(&info, "en"), None);
+    }
+
+    #[test]
+    fn regional_key_is_case_insensitive() {
+        let t = serde_json::json!([{"ext": "json3"}]);
+        let info = info_with(serde_json::json!({"EN-us": t}));
+        assert_eq!(pick_regional_key(&info, "en"), Some("EN-us".into()));
+        let info = info_with(serde_json::json!({"en-US": t}));
+        assert_eq!(pick_regional_key(&info, "EN"), Some("en-US".into()));
+    }
+
+    #[test]
+    fn exact_sub_langs_escapes_regex() {
+        assert_eq!(exact_sub_langs("en-US"), r"en\-US");
+        assert_eq!(exact_sub_langs("zh-Hans"), r"zh\-Hans");
+        assert_eq!(exact_sub_langs("a.b,c"), r"a\.b\,c");
+    }
+
+    #[test]
+    fn regional_args_load_info_and_request_one_track() {
+        let info = Path::new(r"C:\tmp\job\003.abc%1.info.json");
+        let a = build_regional_args(&req("https://youtu.be/abc"), Path::new(r"C:\tmp\job"), info, "en-US");
+        assert_eq!(arg_after(&a, "--sub-langs"), Some(r"en\-US"));
+        assert_eq!(arg_after(&a, "--load-info-json"), Some(r"C:\tmp\job\003.abc%1.info.json"));
+        // No url left, and the refreshed info-json replaces the loaded one.
+        assert!(!a.iter().any(|s| s.contains("youtu.be")));
+        assert!(a.contains(&"infojson:C:/tmp/job/003.abc%%1.%(ext)s".to_string()));
+        for flag in ["--ignore-errors", "--sleep-subtitles", "--skip-download", "--write-subs"] {
+            assert!(a.contains(&flag.to_string()), "missing {flag}");
+        }
+        // The media output template is kept so the file lands next to the first pass'.
+        let r = req("https://youtu.be/abc");
+        assert_eq!(arg_after(&a, "-o"), Some(output_template(&r).as_str()));
+    }
+
+    #[test]
+    fn regional_fallbacks_only_for_videos_without_a_track() {
+        let dir = std::env::temp_dir().join(format!("ytd-test-fallbacks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = serde_json::json!([{"ext": "json3"}]);
+        let ok = serde_json::json!({
+            "subtitles": {"en-US": t},
+            "requested_subtitles": {"en": {"ext": "json3", "filepath": "x"}}
+        });
+        let mut regional = info_with(serde_json::json!({"en-GB": t}));
+        regional["requested_subtitles"] = serde_json::Value::Null;
+        let nothing = info_with(serde_json::json!({"de": t}));
+        for (n, v) in [("001.a", ok), ("002.b", regional), ("003.c", nothing)] {
+            std::fs::write(dir.join(format!("{n}.info.json")), v.to_string()).unwrap();
+        }
+        let got = regional_fallbacks(&dir, "en");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got.len(), 1);
+        assert!(got[0].0.ends_with("002.b.info.json"));
+        assert_eq!(got[0].1, "en-GB");
     }
 
     /// Network smoke test: `cargo test -- --ignored --nocapture`
